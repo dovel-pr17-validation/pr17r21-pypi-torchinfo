@@ -1,0 +1,38 @@
+name: Python package
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+        pytorch-version: ["2.11"]
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install uv and set the python version
+      uses: astral-sh/setup-uv@v6
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Install dependencies
+      run: |
+        uv add torch==${{ matrix.pytorch-version }}
+        uv sync
+    - name: mypy
+      if: ${{ matrix.pytorch-version == '2.11' }}
+      run: |
+        uv run mypy --install-types --non-interactive .
+    - name: pytest
+      if: ${{ matrix.pytorch-version == '2.11' }}
+      run: |
+        uv run pytest --cov=torchinfo --cov-report= --durations=0
+    - name: codecov
+      uses: codecov/codecov-action@v5

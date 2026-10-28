@@ -1,0 +1,793 @@
+from __future__ import annotations
+
+import sys
+import warnings
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from typing import Any, cast
+
+import numpy as np
+import torch
+from torch import nn
+from torch.jit import ScriptModule
+from torch.utils.hooks import RemovableHandle
+
+from .enums import ColumnSettings, Mode, RowSettings, Verbosity
+from .formatting import FormattingOptions
+from .layer_info import LayerInfo, get_children_layers, prod
+from .model_statistics import ModelStatistics
+
+# Some modules do the computation themselves using parameters
+# or the parameters of children. Treat these as layers.
+# TODO: figure out a test case for this
+LAYER_MODULES = (torch.nn.MultiheadAttention,)
+# These modules are not recorded during a forward pass. Handle them separately.
+WRAPPER_MODULES = (ScriptModule,)
+
+INPUT_DATA_TYPE = torch.Tensor | np.ndarray | Sequence[Any] | Mapping[str, Any]
+
+CORRECTED_INPUT_DATA_TYPE = Iterable[Any] | Mapping[Any, Any] | None
+INPUT_SIZE_TYPE = Sequence[int | Sequence[Any] | torch.Size]
+CORRECTED_INPUT_SIZE_TYPE = list[Sequence[Any] | torch.Size]
+
+# A structural context a module is reached through during traversal:
+# (var_name, depth, parent_info). A module shared by several parents has one per
+# parent; the correct one is resolved at runtime by resolve_layer_context().
+LayerContext = tuple[str, int, "LayerInfo | None"]
+
+DEFAULT_COLUMN_NAMES = (ColumnSettings.OUTPUT_SIZE, ColumnSettings.NUM_PARAMS)
+DEFAULT_ROW_SETTINGS = {RowSettings.DEPTH}
+REQUIRES_INPUT = {
+    ColumnSettings.INPUT_SIZE,
+    ColumnSettings.OUTPUT_SIZE,
+    ColumnSettings.MULT_ADDS,
+}
+
+_cached_forward_pass: dict[str, list[LayerInfo]] = {}
+
+
+def summary(
+    model: nn.Module,
+    input_size: INPUT_SIZE_TYPE | None = None,
+    input_data: INPUT_DATA_TYPE | None = None,
+    batch_dim: int | None = None,
+    cache_forward_pass: bool | None = None,
+    col_names: Iterable[str] | None = None,
+    col_width: int = 25,
+    depth: int = 3,
+    device: torch.device | None = None,
+    dtypes: list[torch.dtype] | None = None,
+    mode: str = "same",
+    row_settings: Iterable[str] | None = None,
+    verbose: int | None = None,
+    **kwargs: Any,
+) -> ModelStatistics:
+    """
+    Summarize the given PyTorch model. Summarized information includes:
+        1) Layer names,
+        2) input/output shapes,
+        3) kernel shape,
+        4) # of parameters,
+        5) # of operations (Mult-Adds),
+        6) whether layer is trainable
+
+    NOTE: If neither input_data or input_size are provided, no forward pass through the
+    network is performed, and the provided model information is limited to layer names.
+
+    Args:
+        model (nn.Module):
+                PyTorch model to summarize. The model should be fully in either train()
+                or eval() mode. If layers are not all in the same mode, running summary
+                may have side effects on batchnorm or dropout statistics. If you
+                encounter an issue with this, please open a GitHub issue.
+
+        input_size (Sequence of Sizes):
+                Shape of input data as a List/Tuple/torch.Size
+                (dtypes must match model input, default is FloatTensors).
+                You should include batch size in the tuple.
+                Default: None
+
+        input_data (Sequence of Tensors):
+                Arguments for the model's forward pass (dtypes inferred).
+                If the forward() function takes several parameters, pass in a list of
+                args or a mapping of kwargs (if your forward() function takes in a dict
+                as its only argument, wrap it in a list).
+                Default: None
+
+        batch_dim (int):
+                Batch_dimension of input data. If batch_dim is None, assume
+                input_data / input_size contains the batch dimension, which is used
+                in all calculations. Else, expand all tensors to contain the batch_dim.
+                Specifying batch_dim can be an runtime optimization, since if batch_dim
+                is specified, torchinfo uses a batch size of 1 for the forward pass.
+                Default: None
+
+        cache_forward_pass (bool):
+                If True, cache the run of the forward() function using the model
+                class name as the key. If the forward pass is an expensive operation,
+                this can make it easier to modify the formatting of your model
+                summary, e.g. changing the depth or enabled column types, especially
+                in Jupyter Notebooks.
+                WARNING: Modifying the model architecture or input data/input size when
+                this feature is enabled does not invalidate the cache or re-run the
+                forward pass, and can cause incorrect summaries as a result.
+                Default: False
+
+        col_names (Iterable[str]):
+                Specify which columns to show in the output. Currently supported: (
+                    "input_size",
+                    "output_size",
+                    "num_params",
+                    "params_percent",
+                    "kernel_size",
+                    "groups",
+                    "mult_adds",
+                    "trainable",
+                )
+                Default: ("output_size", "num_params")
+                If input_data / input_size are not provided, only "num_params" is used.
+
+        col_width (int):
+                Width of each column.
+                Default: 25
+
+        depth (int):
+                Depth of nested layers to display (e.g. Sequentials).
+                Nested layers below this depth will not be displayed in the summary.
+                Default: 3
+
+        device (torch.Device):
+                When using input_size, places the generated input tensors on this
+                device and moves the model (and tensor kwargs) to it for the forward
+                pass. If not specified, device is inferred from the model parameters
+                or torch.cuda.is_available().
+                When using input_data, recursively moves all model parameters and
+                input tensor parameters to the specified device.
+                Default: None
+
+        dtypes (List[torch.dtype]):
+                When using input_size, torchinfo by default assumes your input
+                uses FloatTensors. If your model use a different data type, specify
+                that dtype. For multiple inputs, specify the size of both inputs, and
+                also specify the types of each parameter here.
+                Default: None
+
+        mode (str)
+                Either "train", "eval" or "same", which determines whether we call
+                model.train() or model.eval() before calling summary(). In any case,
+                original model mode is restored at the end.
+                Default: "same".
+
+        row_settings (Iterable[str]):
+                Specify which features to show in a row. Currently supported: (
+                    "ascii_only",
+                    "depth",
+                    "var_names",
+                    "hide_recursive_layers",
+                )
+                Default: ("depth",)
+
+        verbose (int):
+                0 (quiet): No output
+                1 (default): Print model summary
+                2 (verbose): Show weight and bias layers in full detail
+                Default: 1
+                If using a Juypter Notebook or Google Colab, the default is 0.
+
+        **kwargs:
+                Other arguments used in `model.forward` function. Passing *args is no
+                longer supported.
+
+    Return:
+        ModelStatistics object
+                See torchinfo/model_statistics.py for more information.
+    """
+    input_data_specified = input_data is not None or input_size is not None
+    columns: tuple[ColumnSettings, ...]
+    if col_names is None:
+        columns = (
+            DEFAULT_COLUMN_NAMES
+            if input_data_specified
+            else (ColumnSettings.NUM_PARAMS,)
+        )
+    else:
+        columns = tuple(ColumnSettings(name) for name in col_names)
+
+    if row_settings is None:
+        rows = DEFAULT_ROW_SETTINGS
+    else:
+        rows = {RowSettings(name) for name in row_settings}
+
+    model_mode = Mode(mode)
+
+    if verbose is None:
+        verbose = 0 if hasattr(sys, "ps1") and sys.ps1 else 1
+
+    if cache_forward_pass is None:
+        # In the future, this may be enabled by default in Jupyter Notebooks
+        cache_forward_pass = False
+
+    input_size_device: torch.device | None = None
+    if input_size is not None:
+        input_size_device = device if device is not None else get_device(model, None)
+
+    validate_user_params(
+        input_data,
+        input_size,
+        columns,
+        col_width,
+        input_size_device if input_size is not None else device,
+        dtypes,
+        verbose,
+    )
+
+    x, correct_input_size = process_input(
+        input_data, input_size, batch_dim, input_size_device, dtypes
+    )
+    forward_device = input_size_device if input_size is not None else None
+    summary_list = forward_pass(
+        model, x, batch_dim, cache_forward_pass, forward_device, model_mode, **kwargs
+    )
+    formatting = FormattingOptions(depth, verbose, columns, col_width, rows)
+    results = ModelStatistics(
+        summary_list, correct_input_size, get_total_memory_used(x), formatting
+    )
+    if verbose > Verbosity.QUIET:
+        print(results)
+    return results
+
+
+def process_input(
+    input_data: INPUT_DATA_TYPE | None,
+    input_size: INPUT_SIZE_TYPE | None,
+    batch_dim: int | None,
+    device: torch.device | None,
+    dtypes: list[torch.dtype] | None = None,
+) -> tuple[CORRECTED_INPUT_DATA_TYPE, Any]:
+    """Reads sample input data to get the input size."""
+    x = None
+    correct_input_size = []
+    if input_data is not None:
+        correct_input_size = get_input_data_sizes(input_data)
+        x = input_data
+        if isinstance(x, (torch.Tensor, np.ndarray)):
+            x = [x]
+
+    if input_size is not None:
+        assert device is not None
+        if dtypes is None:
+            dtypes = [torch.float] * len(input_size)
+        correct_input_size = get_correct_input_sizes(input_size)
+        x = get_input_tensor(correct_input_size, batch_dim, dtypes, device)
+    return x, correct_input_size
+
+
+def forward_pass(
+    model: nn.Module,
+    x: CORRECTED_INPUT_DATA_TYPE,
+    batch_dim: int | None,
+    cache_forward_pass: bool,
+    device: torch.device | None,
+    mode: Mode,
+    **kwargs: Any,
+) -> list[LayerInfo]:
+    """Perform a forward pass on the model using forward hooks."""
+    global _cached_forward_pass
+    model_name = model.__class__.__name__
+    if cache_forward_pass and model_name in _cached_forward_pass:
+        return _cached_forward_pass[model_name]
+
+    summary_list, _, hooks = apply_hooks(model_name, model, x, batch_dim)
+    if x is None:
+        set_children_layers(summary_list)
+        return summary_list
+
+    kwargs = set_device(kwargs, device)
+    saved_model_mode = model.training
+    try:
+        if mode == Mode.TRAIN:
+            model.train()
+        elif mode == Mode.EVAL:
+            model.eval()
+        elif mode != Mode.SAME:
+            raise RuntimeError(
+                f"Specified model mode ({list(Mode)}) not recognized: {mode}"
+            )
+
+        with torch.no_grad():
+            model = model if device is None else model.to(device)
+            if isinstance(x, (list, tuple)):
+                _ = model(*x, **kwargs)
+            elif isinstance(x, Mapping):
+                _ = model(**x, **kwargs)
+            else:
+                # Should not reach this point, since process_input_data ensures
+                # x is either a list, tuple, or mapping
+                raise ValueError("Unknown input type")
+    except Exception as e:
+        executed_layers = [layer for layer in summary_list if layer.executed]
+        raise RuntimeError(
+            "Failed to run torchinfo. See above stack traces for more details. "
+            f"Executed layers up to: {executed_layers}"
+        ) from e
+    finally:
+        if hooks:
+            for pre_hook, hook in hooks.values():
+                pre_hook.remove()
+                hook.remove()
+        model.train(saved_model_mode)
+
+    add_missing_container_layers(summary_list)
+    set_children_layers(summary_list)
+
+    if cache_forward_pass:
+        _cached_forward_pass[model_name] = summary_list
+    return summary_list
+
+
+def set_children_layers(summary_list: list[LayerInfo]) -> None:
+    """Populates the children and depth_index fields of all LayerInfo."""
+    idx: dict[int, int] = {}
+    for i, layer in enumerate(summary_list):
+        idx[layer.depth] = idx.get(layer.depth, 0) + 1
+        layer.depth_index = idx[layer.depth]
+        layer.children = get_children_layers(summary_list, i)
+
+
+def add_missing_container_layers(summary_list: list[LayerInfo]) -> None:
+    """Finds container modules not in the currently listed hierarchy."""
+    layer_ids = {layer.layer_id for layer in summary_list}
+    current_hierarchy: dict[int, LayerInfo] = {}
+    for idx, layer_info in enumerate(summary_list):
+        # to keep track index of current layer
+        # after inserting new layers
+        rel_idx = 0
+
+        # create full hierarchy of current layer
+        hierarchy = {}
+        parent = layer_info.parent_info
+        while parent is not None and parent.depth > 0:
+            hierarchy[parent.depth] = parent
+            parent = parent.parent_info
+
+        # show hierarchy if it is not there already
+        for d in range(1, layer_info.depth):
+            if (
+                d not in current_hierarchy
+                or current_hierarchy[d].module is not hierarchy[d].module
+            ) and hierarchy[d] is not summary_list[idx + rel_idx - 1]:
+                hierarchy[d].calculate_num_params()
+                hierarchy[d].check_recursive(layer_ids)
+                summary_list.insert(idx + rel_idx, hierarchy[d])
+                layer_ids.add(hierarchy[d].layer_id)
+
+                current_hierarchy[d] = hierarchy[d]
+                rel_idx += 1
+
+        current_hierarchy[layer_info.depth] = layer_info
+
+        # remove deeper hierarchy
+        d = layer_info.depth + 1
+        while d in current_hierarchy:
+            current_hierarchy.pop(d)
+            d += 1
+
+
+def validate_user_params(
+    input_data: INPUT_DATA_TYPE | None,
+    input_size: INPUT_SIZE_TYPE | None,
+    col_names: tuple[ColumnSettings, ...],
+    col_width: int,
+    device: torch.device | None,
+    dtypes: list[torch.dtype] | None,
+    verbose: int,
+) -> None:
+    """Raise exceptions if the user's input is invalid."""
+    if col_width <= 0:
+        raise ValueError(f"Column width must be greater than 0: col_width={col_width}")
+    if verbose not in (0, 1, 2):
+        raise ValueError(
+            "Verbose must be either 0 (quiet), 1 (default), or 2 (verbose)."
+        )
+    both_input_specified = input_data is not None and input_size is not None
+    if both_input_specified:
+        raise RuntimeError("Only one of (input_data, input_size) should be specified.")
+
+    neither_input_specified = input_data is None and input_size is None
+    not_allowed = set(col_names) & REQUIRES_INPUT
+    if neither_input_specified and not_allowed:
+        raise ValueError(
+            "You must pass input_data or input_size in order "
+            f"to use columns: {not_allowed}"
+        )
+
+    if dtypes is not None and any(
+        dtype in (torch.float16, torch.bfloat16) for dtype in dtypes
+    ):
+        if input_size is not None:
+            warnings.warn(
+                "Half precision is not officially supported with the `input_size` "
+                "parameter, as it may output incorrect size estimation results. We "
+                "recommend passing `input_data` directly.",
+                stacklevel=2,
+            )
+        if device is not None and device.type == "cpu":
+            warnings.warn(
+                "Half precision is not supported on cpu. Set the `device` field or "
+                "pass `input_data` using the correct device.",
+                stacklevel=2,
+            )
+
+
+def traverse_input_data(
+    data: Any, action_fn: Callable[..., Any], aggregate_fn: Callable[..., Any]
+) -> Any:
+    """
+    Traverses any type of nested input data. On a tensor, returns the action given by
+    action_fn, and afterwards aggregates the results using aggregate_fn.
+    """
+    if isinstance(data, torch.Tensor):
+        result = action_fn(data)
+    elif isinstance(data, np.ndarray):
+        result = action_fn(torch.from_numpy(data))
+        # If the result of action_fn is a torch.Tensor, then action_fn was meant for
+        #   torch.Tensors only (like calling .to(...)) -> Ignore.
+        if isinstance(result, torch.Tensor):
+            result = data
+
+    # Recursively apply to collection items
+    elif isinstance(data, Mapping):
+        aggregate = aggregate_fn(data)
+        result = aggregate(
+            {
+                k: traverse_input_data(v, action_fn, aggregate_fn)
+                for k, v in data.items()
+            }
+        )
+    elif isinstance(data, tuple) and hasattr(data, "_fields"):  # Named tuple
+        aggregate = aggregate_fn(data)
+        result = aggregate(
+            *(traverse_input_data(d, action_fn, aggregate_fn) for d in data)
+        )
+    elif isinstance(data, Iterable) and not isinstance(data, str):
+        aggregate = aggregate_fn(data)
+        result = aggregate(
+            [traverse_input_data(d, action_fn, aggregate_fn) for d in data]
+        )
+    else:
+        # Data is neither a tensor nor a collection
+        result = data
+    return result
+
+
+def set_device(data: Any, device: torch.device | None) -> Any:
+    """Sets device for all input types and collections of input types."""
+    return (
+        data
+        if device is None
+        else traverse_input_data(
+            data,
+            action_fn=lambda data: data.to(device, non_blocking=True),
+            aggregate_fn=type,
+        )
+    )
+
+
+def get_device(
+    model: nn.Module, input_data: INPUT_DATA_TYPE | None
+) -> torch.device | None:
+    """
+    If input_data is given, the device should not be changed
+    (to allow for multi-device models, etc.)
+
+    Otherwise gets device of first parameter of model and returns it,
+    otherwise returns current accelerator if it is available,
+    otherwise returns cpu.
+    """
+    if input_data is None:
+        try:
+            model_parameter = next(model.parameters())
+        except StopIteration:
+            model_parameter = None
+
+        if model_parameter is not None and model_parameter.device:
+            return model_parameter.device
+        if torch.accelerator.is_available():
+            return torch.accelerator.current_accelerator()
+        return torch.device("cpu")
+    return None
+
+
+def get_input_data_sizes(data: Any) -> Any:
+    """
+    Converts input data to an equivalent data structure of torch.Sizes
+    instead of tensors.
+    """
+    return traverse_input_data(
+        data, action_fn=lambda data: data.size(), aggregate_fn=type
+    )
+
+
+def get_tensor_memory(data: torch.Tensor) -> int:
+    """Calculates the memory of a single tensor, including sparse layouts."""
+    try:
+        storage = (
+            data.untyped_storage()
+            if hasattr(data, "untyped_storage")
+            else data.storage()  # type: ignore[no-untyped-call]
+        )
+        return sys.getsizeof(storage)
+    except NotImplementedError:
+        # Sparse tensors (COO, CSR, ...) expose no single storage,
+        # so sum the member tensors instead. Accessors differ per
+        # layout, so probe the known ones and keep what succeeds.
+        members: list[torch.Tensor] = [data.values()]
+        for name in (
+            "indices",
+            "crow_indices",
+            "col_indices",
+            "ccol_indices",
+            "row_indices",
+        ):
+            getter = getattr(data, name, None)
+            if getter is None:
+                continue
+            try:
+                member = getter()
+            except NotImplementedError:
+                continue
+            except RuntimeError:
+                continue
+            members.append(member)
+        return sum(get_tensor_memory(member) for member in members)
+
+
+def get_total_memory_used(data: CORRECTED_INPUT_DATA_TYPE) -> int:
+    """Calculates the total memory of all tensors stored in data."""
+    result = traverse_input_data(
+        data,
+        action_fn=get_tensor_memory,
+        aggregate_fn=(
+            # We don't need the dictionary keys in this case
+            lambda data: (
+                (lambda d: sum(v for v in d.values() if isinstance(v, int)))
+                if isinstance(data, Mapping)
+                else sum
+            )
+        ),
+    )
+    return cast("int", result)
+
+
+def get_input_tensor(
+    input_size: CORRECTED_INPUT_SIZE_TYPE,
+    batch_dim: int | None,
+    dtypes: list[torch.dtype],
+    device: torch.device,
+) -> list[torch.Tensor]:
+    """Get input_tensor with batch size 1 for use in model.forward()"""
+    x = []
+    for size, dtype in zip(input_size, dtypes, strict=False):
+        input_tensor = torch.rand(*size) if size else torch.rand(())
+        if batch_dim is not None:
+            input_tensor = input_tensor.unsqueeze(dim=batch_dim)
+        x.append(input_tensor.to(device).type(dtype))
+    return x
+
+
+def flatten(nested_array: INPUT_SIZE_TYPE) -> Iterator[Any]:
+    """Flattens a nested array."""
+    for item in nested_array:
+        if isinstance(item, (list, tuple)):
+            yield from flatten(item)
+        else:
+            yield item
+
+
+def get_correct_input_sizes(input_size: INPUT_SIZE_TYPE) -> CORRECTED_INPUT_SIZE_TYPE:
+    """
+    Convert input_size to the correct form, which is a list of tuples.
+    Also handles multiple inputs to the network.
+    """
+    if not isinstance(input_size, (list, tuple)):
+        raise TypeError(
+            "Input_size is not a recognized type. Please ensure input_size is valid.\n"
+            "For multiple inputs to the network, ensure input_size is a list of tuple "
+            "sizes. If you are having trouble here, please submit a GitHub issue."
+        )
+    if not input_size or any(size <= 0 for size in flatten(input_size)):
+        raise ValueError("Input_data is invalid, or negative size found in input_data.")
+
+    if isinstance(input_size, list) and isinstance(input_size[0], int):
+        return [tuple(input_size)]
+    if isinstance(input_size, list):
+        return input_size
+    if isinstance(input_size, tuple) and isinstance(input_size[0], tuple):
+        return list(input_size)
+    return [input_size]
+
+
+def resolve_layer_context(
+    contexts: list[LayerContext], module_stack: list[LayerInfo]
+) -> LayerContext:
+    """
+    Pick the structural context (var_name, depth, parent) matching the module's
+    actual parent during the current forward call.
+
+    A module instance shared by several parents is visited once per parent during
+    traversal, producing multiple contexts. Picking statically (as the last one
+    registered) corrupts the hierarchy for all the other call sites. The correct
+    context is the one whose nearest executing ancestor is the module currently on
+    top of the runtime stack.
+    """
+    if len(contexts) == 1 or not module_stack:
+        return contexts[0]
+    top = module_stack[-1]
+    on_stack = {id(frame.module) for frame in module_stack}
+    for context in contexts:
+        parent = context[2]
+        # Walk up past containers (ModuleList/ModuleDict have no forward and never
+        # appear on the runtime stack) to the nearest currently-executing ancestor.
+        while parent is not None and id(parent.module) not in on_stack:
+            parent = parent.parent_info
+        if parent is not None and parent.module is top.module:
+            return context
+    return contexts[0]
+
+
+def construct_pre_hook(
+    global_layer_info: dict[int, LayerInfo],
+    summary_list: list[LayerInfo],
+    layer_ids: set[int],
+    module_contexts: dict[int, list[LayerContext]],
+    module_stack: list[LayerInfo],
+    module_id: int,
+) -> Callable[[nn.Module, Any], None]:
+    def pre_hook(module: nn.Module, inputs: Any) -> None:
+        """Create a LayerInfo object to aggregate layer information."""
+        del inputs
+        var_name, curr_depth, parent_info = resolve_layer_context(
+            module_contexts[module_id], module_stack
+        )
+        info = LayerInfo(var_name, module, curr_depth, parent_info)
+        info.calculate_num_params()
+        info.check_recursive(layer_ids)
+        summary_list.append(info)
+        layer_ids.add(info.layer_id)
+        global_layer_info[info.layer_id] = info
+        module_stack.append(info)
+
+    return pre_hook
+
+
+def construct_hook(
+    global_layer_info: dict[int, LayerInfo],
+    module_stack: list[LayerInfo],
+    batch_dim: int | None,
+) -> Callable[[nn.Module, Any, Any], None]:
+    def hook(module: nn.Module, inputs: Any, outputs: Any) -> None:
+        """Update LayerInfo after forward pass."""
+        info = global_layer_info[id(module)]
+        if info.contains_lazy_param:
+            info.calculate_num_params()
+        info.input_size, _ = info.calculate_size(inputs, batch_dim)
+        info.output_size, elem_bytes = info.calculate_size(outputs, batch_dim)
+        info.output_bytes = elem_bytes * prod(info.output_size)
+        info.executed = True
+        info.calculate_macs()
+        # Pop the frame pushed by this module's pre_hook.
+        #
+        # LIFO assumption: a module's forward calls its children's forwards, so by
+        # Python call-stack nesting the parent's post-hook always fires after every
+        # child's post-hook. The frame this module pushed in its pre_hook is
+        # therefore on top of the stack here.
+        #
+        # Failure modes this guards against: the assumption can only be perturbed by
+        # an exotic setup (e.g. a custom hook that re-enters forward, or a child
+        # whose post-hook is somehow skipped). Rather than blindly popping — which
+        # would corrupt another module's frame — we pop only when the top frame is
+        # this module's own. On a mismatch we leave the stack untouched (fail-safe:
+        # the worst case is a slightly stale stack used for parent resolution of a
+        # shared module, never a wrong pop) and warn, since it may indicate a parent
+        # row is mislabeled in the printed tree.
+        if module_stack and module_stack[-1].module is module:
+            module_stack.pop()
+        else:
+            top = module_stack[-1].module if module_stack else None
+            warnings.warn(
+                f"Unexpected forward-hook order: expected {type(module).__name__} "
+                f"on top of the execution stack, found "
+                f"{type(top).__name__ if top is not None else 'empty stack'}. "
+                "Skipping the stack pop to stay safe; the layer hierarchy for "
+                "shared modules may be slightly inaccurate.",
+                stacklevel=2,
+            )
+
+    return hook
+
+
+def apply_hooks(
+    model_name: str,
+    module: nn.Module,
+    input_data: CORRECTED_INPUT_DATA_TYPE,
+    batch_dim: int | None,
+) -> tuple[
+    list[LayerInfo],
+    dict[int, LayerInfo],
+    dict[int, tuple[RemovableHandle, RemovableHandle]],
+]:
+    """
+    If input_data is provided, recursively adds hooks to all layers of the model.
+    Else, fills summary_list with layer info without computing a
+    forward pass through the network.
+    """
+    summary_list: list[LayerInfo] = []
+    layer_ids: set[int] = set()  # Used to optimize is_recursive()
+    global_layer_info: dict[int, LayerInfo] = {}
+    hooks: dict[int, tuple[RemovableHandle, RemovableHandle]] = {}
+    # All structural contexts each module is reached through. A module shared by
+    # several parents has more than one; the correct one is resolved at runtime.
+    module_contexts: dict[int, list[LayerContext]] = {}
+    # Stack of currently-executing layers, maintained by the pre/post hooks.
+    module_stack: list[LayerInfo] = []
+    stack: list[tuple[str, nn.Module, int, LayerInfo | None]] = [
+        (model_name, module, 0, None)
+    ]
+    while stack:
+        var_name, module, curr_depth, parent_info = stack.pop()
+        module_id = id(module)
+
+        # Fallback is used if the layer's pre-hook is never called, for example in
+        # ModuleLists or Sequentials.
+        global_layer_info[module_id] = LayerInfo(
+            var_name, module, curr_depth, parent_info
+        )
+        module_contexts.setdefault(module_id, []).append(
+            (var_name, curr_depth, parent_info)
+        )
+
+        if input_data is None or isinstance(module, WRAPPER_MODULES):
+            # No forward pass is run, so build the layer directly from this
+            # occurrence's context rather than resolving it dynamically.
+            info = LayerInfo(var_name, module, curr_depth, parent_info)
+            info.calculate_num_params()
+            info.check_recursive(layer_ids)
+            summary_list.append(info)
+            layer_ids.add(info.layer_id)
+            global_layer_info[info.layer_id] = info
+        else:
+            # Register the hook using the last layer that uses this module.
+            if module_id in hooks:
+                for hook in hooks[module_id]:
+                    hook.remove()
+            hooks[module_id] = (
+                module.register_forward_pre_hook(
+                    construct_pre_hook(
+                        global_layer_info,
+                        summary_list,
+                        layer_ids,
+                        module_contexts,
+                        module_stack,
+                        module_id,
+                    )
+                ),
+                module.register_forward_hook(
+                    construct_hook(global_layer_info, module_stack, batch_dim)
+                ),
+            )
+
+        # Replaces the equivalent recursive call by appending all of the
+        # subsequent the module children stack calls in the encountered order.
+        # Note: module.named_modules(remove_duplicate=False) doesn't work for
+        # some unknown reason (infinite recursion)
+        stack += [
+            (name, mod, curr_depth + 1, global_layer_info[module_id])
+            for name, mod in reversed(module._modules.items())
+            if mod is not None
+        ]
+    return summary_list, global_layer_info, hooks
+
+
+def clear_cached_forward_pass() -> None:
+    """Clear the forward pass cache."""
+    global _cached_forward_pass
+    _cached_forward_pass = {}
